@@ -1,0 +1,153 @@
+这是一份为你量身定制的 RGC-TGC 融合模块深度修复报告。我们将这次修复视为一场“外科手术”，从最致命的系统级 Bug 到特征表达的底层逻辑，逐一进行切除和重建。
+
+为了在 4GB 显存的硬件环境下保持训练的高效与流畅，所有的修复方案都严格兼顾了算力成本和显存开销。
+
+---
+
+### 🩺 修复阶段一：治愈 Q 网络的“失忆症”（优先级：⭐⭐⭐⭐⭐）
+
+**病因诊断**：目前每次调用 `select_k()` 都会重新实例化 `QNetwork`，导致强化学习 Agent 每次都在“喝孟婆汤”，之前的探索经验瞬间归零。
+
+**修复处方（代码级改造）**：
+必须让 Q 网络跨越 TGC 的多个 Epoch 持久存在。
+
+1. **调整 `RGCKSelector` 的初始化**：将 Q 网络的创建移到类初始化阶段，或者在首次调用时创建并缓存。
+
+```python
+class RGCKSelector:
+    def __init__(self, ...):
+        # 其他初始化代码...
+        self.q_net = None # 延迟初始化，或者直接在这里初始化
+        self.optimizer_Q = None
+
+    def select_k(self, ...):
+        # 修复：只在第一次调用时初始化 Q 网络和优化器
+        if self.q_net is None:
+            self.q_net = QNetwork(self.hidden_dim, self.num_actions).to(self.device)
+            self.optimizer_Q = torch.optim.Adam(self.q_net.parameters(), lr=1e-3)
+        
+        # 移除原有的每次重新初始化 q_net 的代码！
+        # 后续的 RL 训练将直接在原有的 q_net 权重上继续（热启动）
+
+```
+
+---
+
+### 👁️ 修复阶段二：拯救编码器的“线性荒漠”（优先级：⭐⭐⭐⭐⭐）
+
+**病因诊断**：`DualHeadEncoder` 没有非线性激活函数，本质上只是一个巨大的线性矩阵；同时，KL Loss（权重高达 10）在早期强行拉扯尚未成型的特征，导致 InfoNCE 根本无法学到有用的表示。
+
+**修复处方（模型与 Loss 改造）**：
+
+1. **给 Encoder 注入非线性灵魂**：
+
+```python
+class DualHeadEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=500):
+        super().__init__()
+        self.lin1 = nn.Linear(input_dim, hidden_dim)
+        # 添加 PReLU 或 ReLU，赋予非线性拟合能力
+        self.act1 = nn.PReLU() 
+        self.lin2 = nn.Linear(input_dim, hidden_dim)
+        self.act2 = nn.PReLU()
+        
+    def forward(self, x):
+        z1 = F.normalize(self.act1(self.lin1(x)), p=2, dim=1)
+        z2 = F.normalize(self.act2(self.lin2(x)), p=2, dim=1)
+        return z1, z2
+
+```
+
+2. **动态退火 KL Loss 权重**：
+彻底废除固定 `10 * kl_loss` 的暴政。采用温和的渐进策略，先让 InfoNCE 跑马圈地，再让 KL Loss 收拢聚类。
+
+```python
+# 在 _train_step 或主循环中动态计算 kl_weight
+# 假设 total_epochs = 100，当前 epoch 为 current_epoch
+if current_epoch < 20:
+    kl_weight = 0.0  # 前 20 轮纯对比学习，找准特征空间
+else:
+    # 20 轮后逐渐升至 1.0 或 5.0，不要直接给 10
+    kl_weight = min(5.0, (current_epoch - 20) * 0.1) 
+
+loss = info_loss + kl_weight * kl_loss
+
+```
+
+3. **安全高效的 InfoNCE 采样**：
+在进行图对比学习时，不要强行扩大采样数量。设置 `max_infonce_nodes = min(N, 2500)` 是非常理智的。对于超大图，每轮随机采样 2500 个节点足以提供无偏梯度，且能绝对保障 4GB 显存的安全底线。
+
+---
+
+### ⚖️ 修复阶段三：重塑奖励函数的“价值观”（优先级：⭐⭐⭐⭐）
+
+**病因诊断**：原奖励函数 $(center\_dis - min\_dis\_mean) / K^{0.3}$ 极易陷入负数死循环，并且对 $K$ 的惩罚力度如同隔靴搔痒。
+
+**修复处方（Reward 公式重构）**：
+将相减改为**相除**（类似轮廓系数的逻辑），确保奖励永远为正且更具辨识度，同时加大 $K$ 的惩罚力度。
+
+```python
+def _compute_reward(self, centers, dis, K):
+    # 簇间距离（越大越好），加 epsilon 防止除零
+    center_dis = torch.cdist(centers, centers, p=2).mean() 
+    # 簇内距离（越小越好）
+    min_dis_mean = dis.min(dim=1).values.mean() 
+    
+    # 修复：采用比值形式，确保 reward 在 0 到正无穷之间
+    # 修复：将 K^0.3 加大到 K^0.5 或者使用对数惩罚 math.log(K + 1)
+    k_penalty = math.sqrt(K) 
+    
+    # +1e-6 防止分母为 0
+    reward = (center_dis / (min_dis_mean + 1e-6)) / k_penalty 
+    
+    return reward.item()
+
+```
+
+---
+
+### 🔭 修复阶段四：纠正动作空间的“短视症”（优先级：⭐⭐⭐）
+
+**病因诊断**：$\epsilon$-greedy 的探索率 $\epsilon$ 下降过快，且 `best_K` 的初始判断逻辑存在偏差，容易将模型锁死在毫无意义的中位数值上。
+
+**修复处方（探索策略调优）**：
+
+1. **放缓 $\epsilon$ 衰减速度**：
+给模型足够的时间去试错。
+
+```python
+# 建议改为余弦衰减或更平缓的线性衰减
+# 确保在前 50% 的探索期内，epsilon 保持在 0.2 以上
+self.epsilon = max(self.min_epsilon, self.initial_epsilon * (0.98 ** current_rl_epoch))
+
+```
+
+2. **修正 Best K 的决断逻辑**：
+废弃默认使用中位数作为 `best_k` 的逻辑。如果在某个 RL 周期内所有选过的 $K$ 的奖励都很差（例如早期），不要强行更新 `TGC` 的 $K$ 值，保持上一轮的 $K$ 不变。
+
+```python
+def _get_best_k(self):
+    best_k = self.current_k # 默认保持当前 K，而不是取中位数！
+    best_avg_reward = -float('inf')
+    
+    for k in self.candidate_ks:
+        # 增加统计置信度：至少被探索过 5 次才参与竞选
+        if len(self.reward_history[k]) >= 5: 
+            avg_r = np.mean(self.reward_history[k][-10:])
+            if avg_r > best_avg_reward:
+                best_avg_reward = avg_r
+                best_k = k
+                
+    return best_k
+
+```
+
+---
+
+### 📝 最终执行建议的实施顺序
+
+1. **先改代码结构**：第一把火烧在 `q_net` 的生命周期上，把它从方法里拎出来变成类的实例属性，这是跑通 RL 的绝对基石。
+2. **再改网络骨架**：给 `DualHeadEncoder` 加上 `PReLU`，马上运行观察 Loss，你会发现特征降维的 Loss 开始有意义地下降了。
+3. **后调权重公式**：应用动态 `kl_weight` 和除法形式的 `Reward` 函数。
+
+执行完这套外科手术，你的模型就能在一个既不炸显存、又具备长期记忆的健康状态下，真正实现对未知 K 值的自适应探索。

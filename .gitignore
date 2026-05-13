@@ -1,0 +1,9 @@
+.idea/
+.claude/
+__pycache__/
+*.pyc
+.DS_Store
+data/
+*.zip
+*.rar
+*.emb
